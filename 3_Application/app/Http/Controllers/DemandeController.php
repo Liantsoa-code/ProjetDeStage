@@ -26,7 +26,7 @@ class DemandeController extends Controller
 
         // Récupère uniquement les demandes de l'utilisateur connecté
         $demandes = Demande::where('user_id', Auth::id())
-            ->with(['site', 'typeDemande', 'statut'])
+            ->with(['site:id,nom', 'typeDemande:id,libelle', 'statut:id,code,libelle'])
             ->when($statut !== '', fn ($q) => $q->whereHas('statut', fn ($s) => $s->where('code', $statut)))
             ->orderBy('created_at', 'desc')
             ->paginate(10)
@@ -51,7 +51,7 @@ class DemandeController extends Controller
         $this->assertOwner($demande);
 
         $demande->load([
-            'site', 'typeDemande', 'statut', 'documents',
+            'site:id,nom', 'typeDemande', 'statut', 'documents',
             'historiqueStatuts' => fn ($q) => $q->orderBy('date_changement'),
             'historiqueStatuts.user:id,name,role',
             'historiqueStatuts.nouveauStatut',
@@ -149,7 +149,13 @@ class DemandeController extends Controller
             return back()->withErrors(['date_debut' => 'Impossible : vos dates chevauchent une période d\'interdiction stricte (bloquante) sur ce site.']);
         }
 
-        DB::transaction(function () use ($request, $demande, $validated, $typeDemande, $soumission, $renvoiComplement, $ancienStatut, $analyse) {
+        $statutChange = DB::transaction(function () use ($request, $demande, $validated, $typeDemande, $soumission, $renvoiComplement, $ancienStatut, $analyse) {
+            // Verrou : une décision du validateur prise pendant la saisie ne doit pas être écrasée.
+            $statutActuel = Demande::whereKey($demande->id)->lockForUpdate()->value('statut_id');
+            if ((int) $statutActuel !== (int) $ancienStatut->id) {
+                return true;
+            }
+
             $champs = [
                 'site_id' => $validated['site_id'],
                 'type_demande_id' => $validated['type_demande_id'],
@@ -179,7 +185,14 @@ class DemandeController extends Controller
 
             $demande->update($champs);
             DemandeDossier::syncDocuments($demande, $request, $typeDemande);
+
+            return false;
         });
+
+        if ($statutChange) {
+            return redirect()->route('demandes.show', $demande)
+                ->with('error', "Le statut de cette demande a changé entre-temps : vos modifications n'ont pas été enregistrées.");
+        }
 
         $demande->refresh();
 
